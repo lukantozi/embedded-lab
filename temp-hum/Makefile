@@ -6,7 +6,7 @@ CC = gcc
 CCARV = avr-gcc
 OBJCOPY = avr-objcopy
 ARVDUDE = avrdude
-CFLAGS = -Os -DF_CPU=$(F_CPU) -mmcu=$(MCU)
+CFLAGS = -Os -DF_CPU=$(F_CPU) -mmcu=$(MCU) -Wall -Wextra
 LDFLAGS = -mmcu=$(MCU)
 DUDEFLAGS = -c arduino -p m328p -P $(PORT) -b 115200
 

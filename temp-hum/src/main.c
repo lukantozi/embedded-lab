@@ -44,6 +44,18 @@ void usart_data_transmit(char *msg)
     }
 }
 
+#define USART_REPORT_DATA(ival, dval, type)       \
+do {                                              \
+    usart_data_transmit(type);                    \
+    usart_data_transmit(": ");                    \
+    itoa(ival, data, 10);                         \
+    usart_data_transmit(data);                    \
+    usart_char_transmit('.');                     \
+    itoa(dval, data, 10);                         \
+    usart_data_transmit(data);                    \
+    usart_data_transmit("\r\n");                  \
+} while (0)
+
 void dht11_request(void)
 {
     DDRD |= (1 << DHT11_PIN);   // config as output
@@ -75,86 +87,11 @@ uint8_t dht11_data_receive(void)
 	return byte;
 }
 
-#define SEND_FORMATTED_DATA(ival, dval, type)     \
-do {                                              \
-    usart_data_transmit(type);                    \
-    usart_data_transmit(": ");                    \
-    itoa(ival, data, 10);                         \
-    usart_data_transmit(data);                    \
-    usart_char_transmit('.');                     \
-    itoa(dval, data, 10);                         \
-    usart_data_transmit(data);                    \
-    usart_data_transmit("\r\n");                  \
-} while (0)
-
 void twi_init(void)
 {
     TWSR &= ~3;                          // prescalar value 1
     TWBR = (F_CPU / SCL_FREQ - 16) / 2;
     TWCR = 1 << TWEN;                    // enable twi
-}
-
-void transaction_begin(void)
-{
-    TWCR |= (1 << TWINT) | (1 << TWSTA);              // send START cond
-    while (!(TWCR & (1 << TWINT)));                   // wait for TWINT flag set
-    if ((TWSR & 0xf8) != START) {
-        usart_data_transmit("START didn't transmit\r\n");
-        return;                                       // handle error
-    }
-
-    TWDR = SLAVE_ADDRESS;
-    TWCR = (1 << TWINT) | (1 << TWEN);
-    while (!(TWCR & (1 << TWINT)));
-    if ((TWSR & 0xf8) != MT_SLA_ACK) {
-        usart_data_transmit("SLA didn't transmit\r\n");
-        return;                                       // handle error
-    }
-}
-
-void pcf8574_write(unsigned char c)
-{
-    TWDR = c;
-    TWCR = (1 << TWINT) | (1 << TWEN);
-    while (!(TWCR & (1 << TWINT)));
-    if ((TWSR & 0xf8) != MT_DATA_ACK) {
-        usart_data_transmit("DATA didn't transmit\r\n");
-        return;
-    }
-}
-
-void write_4bits(unsigned char bits)
-{
-    pcf8574_write(bits);
-    _delay_us(1);
-
-    pcf8574_write(bits | (1 << 2));
-    _delay_us(1);
-
-    pcf8574_write(bits);
-    _delay_us(50);
-}
-
-void twi_prepare_signals(void)
-{
-    _delay_ms(50);
-
-    write_4bits(0x38);
-    _delay_ms(5);
-
-    write_4bits(0x38);
-    _delay_ms(5);
-
-    write_4bits(0x38);
-    _delay_ms(5);
-}
-
-void lcd_send_bytes(unsigned char bytes, unsigned char rs)
-{
-    unsigned char control = 0x08 | (rs & 1);
-
-    write_4bits((bytes & 0xf0) | control);
-    write_4bits(((bytes << 4) & 0xf0) | control);
 }
 
 void twi_stop(void)
@@ -163,71 +100,251 @@ void twi_stop(void)
     while (TWCR & (1 << TWSTO));
 }
 
-void lcd_send_string(char *s)
-{
-    while (*s) {
-        lcd_send_bytes(*s++, 1);
-    }
-}
-
-void lcd_display_clear(void)
-{
-    lcd_send_bytes(0x01, 0);
-    _delay_ms(2);
-    lcd_send_bytes(0x80, 0);
-}
-
-void message_sensor_ready(void)
-{
-    transaction_begin();
-    lcd_display_clear();
-    lcd_send_string("Sensor ready.");
-}
-
-#define LCD_DISPLAY_FORMATTED(ival, dval, type)         \
-do {                                                    \
-    lcd_send_string(type);                              \
-    itoa(ival, data, 10);                               \
-    lcd_send_string(data);                              \
-    lcd_send_bytes('.', 1);                             \
-    itoa(dval, data, 10);                               \
-    lcd_send_string(data);                              \
-    lcd_send_string(type[0] == 'H' ? " %" : " C");      \
+#define REPORT_ERROR(blame, from, n, t, r)                     \
+do {                                                           \
+    usart_data_transmit("[" blame " failed] " from #n" \r\n"); \
+    if (t == 1)                                                \
+        twi_stop();                                            \
+    if (r == 0)                                                \
+        return 0;                                              \
 } while (0)
 
-int main(int argc, char *argv[])
+
+int transaction_begin(void)
+{
+    TWCR |= (1 << TWINT) | (1 << TWSTA);              // send START cond
+    while (!(TWCR & (1 << TWINT)));                   // wait for TWINT flag set
+    if ((TWSR & 0xf8) != START)
+        REPORT_ERROR("START set", "transaction_begin", 1, 0, 0);
+
+    TWDR = SLAVE_ADDRESS;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+    if ((TWSR & 0xf8) != MT_SLA_ACK)
+        REPORT_ERROR("SLA set", "transaction_begin", 1, 0, 0);
+
+    return 1;
+}
+
+int pcf8574_write(unsigned char c)
+{
+    TWDR = c;
+    TWCR = (1 << TWINT) | (1 << TWEN);
+    while (!(TWCR & (1 << TWINT)));
+    if ((TWSR & 0xf8) != MT_DATA_ACK)
+        REPORT_ERROR("DATA ACK", "pcf8574_write", 1, 0, 0);
+    return 1;
+}
+
+int write_4bits(unsigned char bits)
+{
+    if (pcf8574_write(bits) == 0)
+        REPORT_ERROR("pcf8574_write", "write_4bits", 1, 0, 0);
+    _delay_us(1);
+
+    if (pcf8574_write(bits | (1 << 2)) == 0)
+        REPORT_ERROR("pcf8574_write", "write_4bits", 2, 0, 0);
+    _delay_us(1);
+
+    if (pcf8574_write(bits) == 0)
+        REPORT_ERROR("pcf8574_write", "write_4bits", 3, 0, 0);
+    _delay_us(50);
+
+    return 1;
+}
+
+int lcd_prepare(void)
+{
+    _delay_ms(20);           // at least 15ms less than 40ms for 4.5V
+
+    if (write_4bits(0x38) == 0)
+        REPORT_ERROR("write_4bits", "lcd_prepare", 1, 0, 0);
+    _delay_ms(5);            // at least 4.1 ms
+
+    if (write_4bits(0x38) == 0)
+        REPORT_ERROR("write_4bits", "lcd_prepare", 2, 0, 0);
+    _delay_us(150);         // at least 100us
+
+    if (write_4bits(0x38) == 0)
+        REPORT_ERROR("write_4bits", "lcd_prepare", 3, 0, 0);
+    _delay_us(150);
+
+    if (write_4bits(0x28) == 0)
+        REPORT_ERROR("write_4bits", "lcd_prepare", 4, 0, 0);
+
+    return 1;
+}
+
+int lcd_send_bytes(unsigned char bytes, unsigned char rs)
+{
+    unsigned char control = 0x08 | (rs & 1);
+
+    if (write_4bits((bytes & 0xf0) | control) == 0)
+        REPORT_ERROR("write_4bits", "lcd_send_bytes", 1, 0, 0);
+
+    if (write_4bits(((bytes << 4) & 0xf0) | control) == 0)
+        REPORT_ERROR("write_4bits", "lcd_send_bytes", 2, 0, 0);
+
+    return 1;
+}
+
+int lcd_send_string(const char *s)
+{
+    while (*s) {
+        if (lcd_send_bytes(*s++, 1) == 0)
+            REPORT_ERROR("lcd_send_bytes", "lcd_send_string", 1, 0, 0);
+    }
+    return 1;
+}
+
+int lcd_display_clear(void)
+{
+    if (lcd_send_bytes(0x01, 0) == 0)
+        REPORT_ERROR("lcd_send_bytes", "lcd_display_clear", 1, 0, 0);
+    _delay_ms(2);
+
+    if (lcd_send_bytes(0x80, 0) == 0) 
+        REPORT_ERROR("lcd_send_bytes", "lcd_display_clear", 2, 0, 0);
+
+    return 1;
+}
+
+int message_sensor_ready(void)
+{
+    if (transaction_begin() == 0) {
+        REPORT_ERROR("transaction_begin", "message_sensor_ready", 1, 1, 0);
+    }
+
+    if (lcd_display_clear() == 0) {
+        REPORT_ERROR("lcd_display_clear", "message_sensor_ready", 1, 1, 0);
+    }
+
+    if (lcd_send_string("Sensor ready.") == 0) {
+        REPORT_ERROR("lcd_send_string", "message_sensor_ready", 1, 1, 0);
+    }
+
+    twi_stop();
+    _delay_ms(1000);
+    return 1;
+}
+void usart_report_data(uint8_t ival_h, uint8_t dval_h, uint8_t ival_t, uint8_t dval_t)
+{
+    char data[5];
+    USART_REPORT_DATA(ival_h, dval_h, "Humidity");
+    USART_REPORT_DATA(ival_t, dval_t, "Temperature");
+}
+
+int lcd_display_formatted(uint8_t ival, uint8_t dval, const char *label)
+{
+    char data[5];
+
+    if (lcd_send_string(label) == 0)
+        REPORT_ERROR("lcd_send_string", "lcd_display_formatted", 1, 0, 0);
+
+    itoa(ival, data, 10);
+    if (lcd_send_string(data) == 0)
+        REPORT_ERROR("lcd_send_string", "lcd_display_formatted", 2, 0, 0);
+
+    if (lcd_send_bytes('.', 1) == 0)
+        REPORT_ERROR("lcd_send_bytes", "lcd_display_formatted", 1, 0, 0);
+
+    itoa(dval, data, 10);
+    if (lcd_send_string(data) == 0)
+        REPORT_ERROR("lcd_send_string", "lcd_display_formatted", 3, 0, 0);
+
+    if (lcd_send_string(label[0] == 'H' ? " %" : " C") == 0)
+        REPORT_ERROR("lcd_send_string", "lcd_display_formatted", 4, 0, 0);
+
+    return 1;
+}
+
+int lcd_show_data(uint8_t ival_h, uint8_t dval_h, uint8_t ival_t, uint8_t dval_t)
+{
+    if (transaction_begin() == 0)
+        REPORT_ERROR("transaction_begin", "lcd_show_data", 1, 1, 0);
+
+    if (lcd_display_clear() == 0)
+        REPORT_ERROR("lcd_display_clear", "lcd_show_data", 1, 1, 0);
+
+    if (lcd_display_formatted(ival_h, dval_h, "Humi: ") == 0)
+        REPORT_ERROR("lcd_display_formatted", "lcd_show_data", 1, 1, 0);
+
+    if (lcd_send_bytes(0xc0, 0) == 0)
+        REPORT_ERROR("lcd_send_bytes", "lcd_show_data", 1, 1, 0);
+
+    if (lcd_display_formatted(ival_t, dval_t, "Temp: ") == 0)
+        REPORT_ERROR("lcd_display_formatted", "lcd_show_data", 2, 1, 0);
+
+    twi_stop();
+    return 1;
+}
+
+int lcd_init(void)
+{
+    if (transaction_begin() == 0)
+        REPORT_ERROR("transaction_begin", "lcd_init", 1, 1, 0);
+
+    if (lcd_prepare() == 0)
+        REPORT_ERROR("lcd_prepare", "lcd_init", 1, 1, 0);
+
+    if (lcd_send_bytes(0x28, 0) == 0)
+        REPORT_ERROR("lcd_send_bytes", "lcd_init", 1, 1, 0);
+
+    if (lcd_send_bytes(0x08, 0) == 0) // display off at startup
+        REPORT_ERROR("lcd_send_bytes", "lcd_init", 2, 1, 0);
+
+    if (lcd_send_bytes(0x01, 0) == 0) // clear display
+        REPORT_ERROR("lcd_send_bytes", "lcd_init", 2, 1, 0);
+    _delay_ms(2);
+
+    if (lcd_send_bytes(0x06, 0) == 0) // auto increment position
+        REPORT_ERROR("lcd_send_bytes", "lcd_init", 3, 1, 0);
+
+    if (lcd_send_bytes(0x0c, 0) == 0) // display on
+        REPORT_ERROR("lcd_send_bytes", "lcd_init", 4, 1, 0);
+
+    if (lcd_send_string("Booting...") == 0)
+        REPORT_ERROR("lcd_send_string", "lcd_init", 1, 1, 0);
+
+    twi_stop();
+    _delay_ms(1000);
+    return 1;
+}
+
+int lcd_show_error(char *error)
+{
+    if (transaction_begin() == 0)
+        REPORT_ERROR("transaction_begin", "lcd_show_error", 1, 1, 0);
+
+    if (lcd_display_clear() == 0)
+        REPORT_ERROR("lcd_display_clear", "lcd_show_error", 1, 1, 0);
+
+    if (lcd_send_string(error) == 0)
+        REPORT_ERROR("lcd_send_string", "lcd_show_error", 1, 1, 0);
+
+    twi_stop();
+    return 1;
+}
+
+int main(void)
 {
     uint8_t ival_h;
     uint8_t dval_h;
     uint8_t ival_t;
     uint8_t dval_t;
     uint8_t checksum;
-    char data[5];
 
     usart_init();
-    usart_data_transmit("Sensor monitor ready\r\n");
+    usart_data_transmit("[Done] usart_init\r\n");
     twi_init();
-    transaction_begin();
-    twi_prepare_signals();
-    write_4bits(0x28);       // enter 4 bit mode
+    usart_data_transmit("[Done] twi_init\r\n");
+    if (lcd_init() == 0)
+        REPORT_ERROR("lcd_init", "main", 1, 0, 1);
+    else
+        usart_data_transmit("[Done] lcd_init\r\n");
 
-    lcd_send_bytes(0x28, 0); // configure 4-bit, 2 lines, 5x8 font
-    lcd_send_bytes(0x08, 0); // display off at startup
-    lcd_send_bytes(0x01, 0); // clear display
-    _delay_ms(2);
-    lcd_send_bytes(0x06, 0); // auto increment position
-    lcd_send_bytes(0x0c, 0); // display on
-    lcd_send_string("Booting...");
-    twi_stop();
-    _delay_ms(1000);
-
-    message_sensor_ready();
-    twi_stop();
-    _delay_ms(1000);
-
-    unsigned char c;
-    unsigned char buf[34];
-    unsigned int i;
+    if (message_sensor_ready() == 0)
+        REPORT_ERROR("message_sensor_ready", "main", 1, 0, 1);
 
 #if 1
     while (1) {
@@ -242,29 +359,22 @@ int main(int argc, char *argv[])
 
         uint8_t summed = (uint8_t)(ival_h + dval_h + ival_t + dval_t);
         if (summed == checksum) {
-            /* usart */
-            SEND_FORMATTED_DATA(ival_h, dval_h, "Humidity");
-            SEND_FORMATTED_DATA(ival_t, dval_t, "Temperature");
-            /* lcd */
-            transaction_begin();
-            lcd_display_clear();
-            // LCD_DISPLAY_FORMATTED(1, 1, "Humi: ");
-            LCD_DISPLAY_FORMATTED(ival_h, dval_h, "Humi: ");
-            lcd_send_bytes(0xc0, 0);
-            LCD_DISPLAY_FORMATTED(ival_t, dval_t, "Temp: ");
-            // LCD_DISPLAY_FORMATTED(1, 1, "Temp: ");
-            twi_stop();
+            usart_report_data(ival_h, dval_h, ival_t, dval_t);
+            if (lcd_show_data(ival_h, dval_h, ival_t, dval_t) == 0)
+                REPORT_ERROR("lcd_show_data", "main", 1, 0, 1);
         } else {
             usart_data_transmit("Summed doesn't match checksum\r\n");
-            transaction_begin();
-            lcd_display_clear();
-            lcd_send_string("Summed doesn't match checksum");
-            twi_stop();
+            if (lcd_show_error("Checksum error") == 0)
+                REPORT_ERROR("lcd_show_error", "main", 1, 0, 1);
         }
 
         _delay_ms(1500);
     }
-#else // add user responsiveness
+#else // TODO: add user responsiveness
+        unsigned char c;
+        unsigned char buf[34];
+        unsigned int i;
+
         while (1) {
             i = 0;
             usart_data_transmit("Send message: ");
